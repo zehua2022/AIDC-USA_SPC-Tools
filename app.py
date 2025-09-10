@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 # ──────────────────────────────────────────────────────────────────────────────
-# SPC Tool（Web 版，精簡整理版）
-# 功能：
-# 1) 多檔 CSV 上傳 → 清理(移空列/去無用資訊/套標題) → Main/Ref 分群 → 交錯整併
-# 2) 匯出 merged_groups_result.xlsx
-# 3) 頁面直接查詢：輸入「圈碼(數字) + 群組類型(Main/Ref)」→ 繪 Upper/Dimension/Lower 與各來源散點
-# 4) 修正：欄名重複（補充1/補充2 + 欄名唯一化）；使用快取與 session_state 保存處理結果
-# 依賴：streamlit, pandas, numpy, matplotlib, openpyxl, XlsxWriter
+# SPC Tool（Web 版，省記憶體穩定版）
+# 變更重點：
+# - merged 檔案下載改為按需生成（以 DataFrame 簽章快取），不把 bytes 放進 session
+# - st.dataframe 只預覽前 N 列（可調），避免渲染整張大表
+# - 作圖後 plt.close(fig)
+# - 數值 downcast、字串轉 category
 # ──────────────────────────────────────────────────────────────────────────────
 
 import io
 import re
+import hashlib
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -196,8 +196,8 @@ def plot_group(sub: pd.DataFrame, grp_num: str, grp_type: str):
             ax.scatter(g2["序號"], g2["量測值"], label=f"{src}")
 
     ax.set_title(f"No.{grp_num} ({grp_type}) SPC")
-    ax.set_xlabel("Part Order）")
-    ax.set_ylabel("Dimension")
+    ax.set_xlabel("序號（群組內順序）")
+    ax.set_ylabel("尺寸")
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))  # 圖外右側
     ax.grid(True)
@@ -205,10 +205,10 @@ def plot_group(sub: pd.DataFrame, grp_num: str, grp_type: str):
     return fig
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 快取處理：把上傳檔案內容(bytes)交進來，回傳 combined_long 與 merged xlsx 的 bytes
+# 快取處理：把上傳檔案內容(bytes)交進來 → 回傳 combined_long
 # ──────────────────────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=True)
-def process_files(files_payload: list[dict]) -> tuple[pd.DataFrame, bytes]:
+@st.cache_data(show_spinner=True, max_entries=4, ttl=3600)
+def process_files(files_payload: list[dict]) -> pd.DataFrame:
     parts = []
     for item in files_payload:
         name = item["name"]
@@ -219,28 +219,51 @@ def process_files(files_payload: list[dict]) -> tuple[pd.DataFrame, bytes]:
 
     combined = pd.concat(parts, ignore_index=True)
     combined_long = interleave_and_dedup_headers(combined)
-    combined_long.columns = make_unique_columns(list(combined_long.columns))  # 保險
 
-    out_buf = io.BytesIO()
-    with pd.ExcelWriter(out_buf, engine="xlsxwriter") as writer:
-        combined_long.to_excel(writer, sheet_name="combined_long", index=False)
+    # 省記憶體：類別化與 downcast
+    for col in ["來源檔名","群組類型","群組數字"]:
+        if col in combined_long.columns:
+            combined_long[col] = combined_long[col].astype("category")
+    for col in ["序號","目標尺碼","量測值","上偏差","下偏差"]:
+        if col in combined_long.columns:
+            combined_long[col] = pd.to_numeric(combined_long[col], errors="coerce", downcast="float")
+
+    return combined_long
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 下載 merged：按需生成（以 DataFrame 簽章快取）
+# ──────────────────────────────────────────────────────────────────────────────
+def df_signature(df: pd.DataFrame) -> str:
+    h = hashlib.sha256()
+    h.update(str(tuple(df.columns)).encode("utf-8"))
+    s = pd.util.hash_pandas_object(df, index=True)
+    h.update(s.values.tobytes())
+    return h.hexdigest()
+
+@st.cache_data(show_spinner=False)
+def build_merged_xlsx(sig: str, df: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name="combined_long", index=False)
+
         group_counts = (
-            combined_long.loc[~combined_long["是否群組標頭"]]
+            df.loc[~df["是否群組標頭"]]
             .groupby(["群組數字","群組類型","來源檔名"], dropna=True)
             .size().rename("列數").reset_index()
             .sort_values(["群組數字","群組類型","來源檔名"])
         )
         group_counts.to_excel(writer, sheet_name="group_counts", index=False)
+
         seq_alignment = (
-            combined_long.loc[~combined_long["是否群組標頭"]]
+            df.loc[~df["是否群組標頭"]]
             .groupby(["群組數字","群組類型","序號","來源檔名"], dropna=True)
             .size().rename("count").reset_index()
             .pivot_table(index=["群組數字","群組類型","序號"], columns="來源檔名", values="count", fill_value=0)
             .sort_index()
         )
         seq_alignment.to_excel(writer, sheet_name="sequence_alignment")
-    out_buf.seek(0)
-    return combined_long, out_buf.read()
+    out.seek(0)
+    return out.read()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Streamlit 介面
@@ -248,8 +271,8 @@ def process_files(files_payload: list[dict]) -> tuple[pd.DataFrame, bytes]:
 st.set_page_config(page_title="SPC Tool (Web)", layout="wide")
 st.title("SPC Tool（Web 版）")
 
-# 初始化 session_state
-for key in ("files_payload", "combined_long", "merged_xlsx"):
+# 初始化 session_state（不存 bytes）
+for key in ("files_payload", "combined_long", "df_sig"):
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -258,22 +281,29 @@ with st.sidebar:
     st.header("1) 上傳 CSV（可多個）")
     files = st.file_uploader("選擇 CSV", type=["csv"], accept_multiple_files=True, key="csv_uploader")
 
+    # （可選）大小限制，避免 OOM
+    if files:
+        total_bytes = sum(len(f.getvalue()) for f in files)
+        if total_bytes > 50 * 1024 * 1024:  # 50MB
+            st.warning("上傳總大小超過 50MB，建議拆批處理或先在本機清理後再上傳。")
+
     if st.button("清理 + 分群 + 合併"):
         if not files:
             st.warning("請先上傳至少一個 CSV。")
         else:
             payload = [{"name": f.name, "bytes": f.getvalue()} for f in files]
             st.session_state["files_payload"] = payload
-            combined_long, merged_xlsx = process_files(payload)
+            combined_long = process_files(payload)
             st.session_state["combined_long"] = combined_long
-            st.session_state["merged_xlsx"] = merged_xlsx
+            st.session_state["df_sig"] = df_signature(combined_long)
             st.success("✅ 合併完成（資料已保存，可直接查詢圈碼）")
 
-    # 下載 merged xlsx
-    if st.session_state["merged_xlsx"]:
+    # 下載 merged（按需生成＋快取）
+    if st.session_state["combined_long"] is not None:
+        xlsx_bytes = build_merged_xlsx(st.session_state["df_sig"], st.session_state["combined_long"])
         st.download_button(
             "下載 merged_groups_result.xlsx",
-            data=st.session_state["merged_xlsx"],
+            data=xlsx_bytes,
             file_name="merged_groups_result.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
@@ -282,7 +312,9 @@ with st.sidebar:
 combined_long = st.session_state["combined_long"]
 if combined_long is not None:
     st.header("2) 合併後資料")
-    st.dataframe(combined_long, use_container_width=True, height=300)
+    max_rows = st.slider("預覽列數（避免一次載入過多）", 100, 5000, 1000, step=100)
+    st.dataframe(combined_long.head(max_rows), use_container_width=True, height=360)
+    st.caption(f"實際總列數：{len(combined_long):,}（此處僅預覽前 {max_rows:,} 列）")
 
     # 查詢與繪圖
     st.header("3) 查詢與繪圖（不需重上傳）")
@@ -301,6 +333,7 @@ if combined_long is not None:
             else:
                 fig = plot_group(sub, grp_num.strip(), grp_type)
                 st.pyplot(fig, use_container_width=True)
+                plt.close(fig)  # 釋放記憶體
         else:
             st.warning("請輸入純數字的圈碼（例如 92）。")
 
@@ -312,8 +345,17 @@ with st.expander("只用 merged_groups_result.xlsx 進行查詢（可選）"):
             xl = pd.ExcelFile(merged_up)
             combined_from_merged = xl.parse("combined_long")
             combined_from_merged.columns = make_unique_columns(list(combined_from_merged.columns))
+            # 同樣做省記憶體處理
+            for col in ["來源檔名","群組類型","群組數字"]:
+                if col in combined_from_merged.columns:
+                    combined_from_merged[col] = combined_from_merged[col].astype("category")
+            for col in ["序號","目標尺碼","量測值","上偏差","下偏差"]:
+                if col in combined_from_merged.columns:
+                    combined_from_merged[col] = pd.to_numeric(combined_from_merged[col], errors="coerce", downcast="float")
             st.session_state["combined_long"] = combined_from_merged
+            st.session_state["df_sig"] = df_signature(combined_from_merged)
             st.info("✅ 已載入 merged 的 combined_long，現在可直接查詢圈碼。")
         except Exception as e:
             st.error(f"讀取失敗：{e}")
+
 
