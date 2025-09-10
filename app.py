@@ -196,8 +196,8 @@ def plot_group(sub: pd.DataFrame, grp_num: str, grp_type: str):
             ax.scatter(g2["序號"], g2["量測值"], label=f"{src}")
 
     ax.set_title(f"No.{grp_num} ({grp_type}) SPC")
-    ax.set_xlabel("序號（群組內順序）")
-    ax.set_ylabel("尺寸")
+    ax.set_xlabel("Part Order）")
+    ax.set_ylabel("Dimension")
     ax.xaxis.set_major_locator(MaxNLocator(integer=True))
     ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))  # 圖外右側
     ax.grid(True)
@@ -316,3 +316,4 @@ with st.expander("只用 merged_groups_result.xlsx 進行查詢（可選）"):
             st.info("✅ 已載入 merged 的 combined_long，現在可直接查詢圈碼。")
         except Exception as e:
             st.error(f"讀取失敗：{e}")
+
