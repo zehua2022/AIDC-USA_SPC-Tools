@@ -5,6 +5,3 @@ matplotlib
 openpyxl
 xlsxwriter
 requests
-io
-os
-re
